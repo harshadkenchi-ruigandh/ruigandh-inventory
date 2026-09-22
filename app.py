@@ -1,7 +1,9 @@
+import csv
+import io
 import sqlite3
 import urllib.parse
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, flash, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, flash, Response
 
 app = Flask(__name__)
 app.secret_key = "ruigandh-pos-secret"
@@ -21,6 +23,7 @@ def init_db():
                 sku TEXT UNIQUE,
                 cost_price REAL DEFAULT 0,
                 selling_price REAL NOT NULL,
+                min_selling_price REAL DEFAULT 0,
                 stock_qty INTEGER NOT NULL DEFAULT 0
             );
 
@@ -30,6 +33,8 @@ def init_db():
                 customer_name TEXT,
                 customer_phone TEXT,
                 total_amount REAL NOT NULL,
+                total_cost REAL DEFAULT 0,
+                profit REAL DEFAULT 0,
                 payment_mode TEXT DEFAULT 'Cash',
                 created_at TEXT NOT NULL
             );
@@ -39,6 +44,7 @@ def init_db():
                 invoice_id INTEGER NOT NULL,
                 product_id INTEGER NOT NULL,
                 product_name TEXT NOT NULL,
+                cost_price REAL DEFAULT 0,
                 unit_price REAL NOT NULL,
                 quantity INTEGER NOT NULL,
                 subtotal REAL NOT NULL,
@@ -46,8 +52,25 @@ def init_db():
                 FOREIGN KEY (product_id) REFERENCES products(id)
             );
         """)
+        # Safe migration if table already existed without new columns
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(products)")
+        prod_cols = [row[1] for row in cursor.fetchall()]
+        if 'min_selling_price' not in prod_cols:
+            cursor.execute("ALTER TABLE products ADD COLUMN min_selling_price REAL DEFAULT 0")
 
-# Initialize database tables on load so Gunicorn creates tables automatically
+        cursor.execute("PRAGMA table_info(invoices)")
+        inv_cols = [row[1] for row in cursor.fetchall()]
+        if 'total_cost' not in inv_cols:
+            cursor.execute("ALTER TABLE invoices ADD COLUMN total_cost REAL DEFAULT 0")
+        if 'profit' not in inv_cols:
+            cursor.execute("ALTER TABLE invoices ADD COLUMN profit REAL DEFAULT 0")
+
+        cursor.execute("PRAGMA table_info(invoice_items)")
+        item_cols = [row[1] for row in cursor.fetchall()]
+        if 'cost_price' not in item_cols:
+            cursor.execute("ALTER TABLE invoice_items ADD COLUMN cost_price REAL DEFAULT 0")
+
 init_db()
 
 BASE_TEMPLATE = """
@@ -75,11 +98,12 @@ BASE_TEMPLATE = """
     header h1 { margin: 0; font-size: 1.25rem; letter-spacing: 0.5px; }
     nav a { color: #ccfbf1; text-decoration: none; margin-left: 1.25rem; font-weight: 500; font-size: 0.95rem; }
     nav a:hover { color: #fff; text-decoration: underline; }
-    .container { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+    .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
     .grid { display: grid; gap: 1rem; }
     .grid-2 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
-    .grid-4 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+    .grid-5 { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
     label { display: block; font-size: 0.825rem; font-weight: 600; color: var(--muted); margin-bottom: 0.35rem; }
     input, select { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; font-size: 0.95rem; outline: none; }
     input:focus, select:focus { border-color: var(--primary); }
@@ -89,6 +113,8 @@ BASE_TEMPLATE = """
     .btn-secondary:hover { background: #cbd5e1; }
     .btn-danger { background: var(--danger); }
     .btn-danger:hover { background: #dc2626; }
+    .btn-outline { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+    .btn-outline:hover { background: var(--primary); color: white; }
     table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
     th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.92rem; }
     th { background: #f1f5f9; color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
@@ -97,6 +123,8 @@ BASE_TEMPLATE = """
     .badge-low { background: #fee2e2; color: #991b1b; }
     .flash { background: #f0fdf4; border-left: 4px solid var(--success); color: #166534; padding: 0.75rem 1rem; margin-bottom: 1rem; border-radius: 4px; }
     .flash-error { background: #fef2f2; border-left: 4px solid var(--danger); color: #991b1b; }
+    .stat-box { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; text-align: center; }
+    .stat-value { font-size: 1.4rem; font-weight: bold; margin-top: 0.25rem; }
     @media print {
       header, .no-print { display: none !important; }
       body { background: white; margin: 0; padding: 0; }
@@ -107,11 +135,11 @@ BASE_TEMPLATE = """
 </head>
 <body>
   <header>
-    <h1>Ruigandh Billing & Inventory</h1>
+    <h1>Ruigandh Operations</h1>
     <nav class="no-print">
       <a href="{{ url_for('pos') }}">POS / Quick Bill</a>
       <a href="{{ url_for('inventory') }}">Inventory Master</a>
-      <a href="{{ url_for('sales_history') }}">Sales Register</a>
+      <a href="{{ url_for('sales_history') }}">Sales & Profit</a>
     </nav>
   </header>
 
@@ -128,7 +156,7 @@ BASE_TEMPLATE = """
       <div class="card">
         <h2 style="margin-top:0;">New Sale Invoice</h2>
         <form method="POST" action="{{ url_for('checkout') }}" id="posForm">
-          <div class="grid grid-2" style="margin-bottom: 1.5rem;">
+          <div class="grid grid-3" style="margin-bottom: 1.5rem;">
             <div>
               <label>Customer Name</label>
               <input type="text" name="customer_name" placeholder="Walk-in Client">
@@ -151,26 +179,34 @@ BASE_TEMPLATE = """
           <table id="itemsTable">
             <thead>
               <tr>
-                <th style="width: 45%;">Item</th>
-                <th style="width: 20%;">Price (₹)</th>
+                <th style="width: 40%;">Item</th>
+                <th style="width: 20%;">Price (₹) <span style="font-size:0.75rem; color:var(--muted);">(Editable)</span></th>
                 <th style="width: 15%;">Qty</th>
                 <th style="width: 15%;">Total (₹)</th>
-                <th style="width: 5%;"></th>
+                <th style="width: 10%;"></th>
               </tr>
             </thead>
             <tbody id="rowsBody">
               <tr class="item-row">
                 <td>
                   <select name="item_id[]" class="item-select" required onchange="updateRow(this)">
-                    <option value="" data-price="0" data-stock="0">-- Select Product --</option>
+                    <option value="" data-price="0" data-cost="0" data-min="0" data-stock="0">-- Select Product --</option>
                     {% for p in products %}
-                      <option value="{{ p.id }}" data-price="{{ p.selling_price }}" data-stock="{{ p.stock_qty }}" {% if p.stock_qty <= 0 %}disabled{% endif %}>
-                        {{ p.name }} (Stock: {{ p.stock_qty }})
+                      <option value="{{ p.id }}" 
+                              data-price="{{ p.selling_price }}" 
+                              data-cost="{{ p.cost_price }}" 
+                              data-min="{{ p.min_selling_price }}" 
+                              data-stock="{{ p.stock_qty }}" 
+                              {% if p.stock_qty <= 0 %}disabled{% endif %}>
+                        {{ p.name }} (Stock: {{ p.stock_qty }} | Min: ₹{{ p.min_selling_price }})
                       </option>
                     {% endfor %}
                   </select>
                 </td>
-                <td><input type="number" step="0.01" name="unit_price[]" class="price-input" readonly value="0.00"></td>
+                <td>
+                  <input type="number" step="0.01" name="unit_price[]" class="price-input" value="0.00" required onchange="calculateTotals()" onkeyup="calculateTotals()">
+                  <div class="min-price-hint" style="font-size: 0.75rem; color: var(--muted); margin-top: 2px;"></div>
+                </td>
                 <td><input type="number" name="quantity[]" class="qty-input" min="1" value="1" required onchange="calculateTotals()" onkeyup="calculateTotals()"></td>
                 <td><input type="text" class="subtotal-input" readonly value="0.00"></td>
                 <td><button type="button" class="btn btn-danger" onclick="removeRow(this)" style="padding: 0.3rem 0.6rem;">&times;</button></td>
@@ -197,11 +233,17 @@ BASE_TEMPLATE = """
           const row = selectElem.closest('.item-row');
           const opt = selectElem.options[selectElem.selectedIndex];
           const price = parseFloat(opt.getAttribute('data-price') || 0);
+          const minPrice = parseFloat(opt.getAttribute('data-min') || 0);
           const stock = parseInt(opt.getAttribute('data-stock') || 0);
           
           const qtyInput = row.querySelector('.qty-input');
           qtyInput.max = stock;
-          row.querySelector('.price-input').value = price.toFixed(2);
+          const priceInput = row.querySelector('.price-input');
+          priceInput.value = price.toFixed(2);
+          
+          const hint = row.querySelector('.min-price-hint');
+          hint.innerText = minPrice > 0 ? `Min: ₹${minPrice.toFixed(2)}` : '';
+          
           calculateTotals();
         }
 
@@ -225,6 +267,7 @@ BASE_TEMPLATE = """
             if(i.classList.contains('qty-input')) i.value = 1;
             else i.value = '0.00';
           });
+          clone.querySelector('.min-price-hint').innerText = '';
           clone.querySelector('select').selectedIndex = 0;
           body.appendChild(clone);
         }
@@ -242,39 +285,54 @@ BASE_TEMPLATE = """
       <div class="card">
         <h2 style="margin-top: 0;">Add / Restock Product</h2>
         <form method="POST" action="{{ url_for('save_product') }}">
-          <div class="grid grid-4">
+          <div class="grid grid-5">
             <div>
               <label>Product Name</label>
-              <input type="text" name="name" required placeholder="e.g. Handmade Soap / Perfume">
+              <input type="text" name="name" required placeholder="e.g. Scented Candle">
             </div>
             <div>
               <label>SKU / Barcode</label>
               <input type="text" name="sku" placeholder="RUI-101">
             </div>
             <div>
+              <label>Buying Price (Cost ₹)</label>
+              <input type="number" step="0.01" name="cost_price" required placeholder="0.00">
+            </div>
+            <div>
               <label>Selling Price (₹)</label>
               <input type="number" step="0.01" name="selling_price" required placeholder="0.00">
             </div>
             <div>
-              <label>Initial Stock (Units)</label>
-              <input type="number" name="stock_qty" min="0" value="10" required>
+              <label>Min Selling Price (₹)</label>
+              <input type="number" step="0.01" name="min_selling_price" required placeholder="0.00">
             </div>
           </div>
-          <button type="submit" class="btn" style="margin-top: 1rem;">Save Item</button>
+          <div style="display: flex; gap: 1rem; align-items: flex-end; margin-top: 1rem;">
+            <div style="width: 180px;">
+              <label>Initial Units</label>
+              <input type="number" name="stock_qty" min="0" value="10" required>
+            </div>
+            <button type="submit" class="btn">Save Product</button>
+          </div>
         </form>
       </div>
 
       <div class="card">
-        <h2 style="margin-top: 0;">Stock Register</h2>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <h2 style="margin: 0;">Current Inventory</h2>
+          <a href="{{ url_for('download_inventory') }}" class="btn btn-outline">&#8681; Download Inventory CSV</a>
+        </div>
         <table>
           <thead>
             <tr>
               <th>SKU</th>
               <th>Product Name</th>
-              <th>Price</th>
+              <th>Buying Price</th>
+              <th>Selling Price</th>
+              <th>Min Selling Price</th>
               <th>Available Units</th>
               <th>Status</th>
-              <th>Update Stock</th>
+              <th>Quick Stock Add</th>
             </tr>
           </thead>
           <tbody>
@@ -282,8 +340,10 @@ BASE_TEMPLATE = """
             <tr>
               <td>{{ item.sku or '—' }}</td>
               <td><strong>{{ item.name }}</strong></td>
+              <td>₹{{ "%.2f"|format(item.cost_price or 0) }}</td>
               <td>₹{{ "%.2f"|format(item.selling_price) }}</td>
-              <td>{{ item.stock_qty }}</td>
+              <td>₹{{ "%.2f"|format(item.min_selling_price or 0) }}</td>
+              <td><strong>{{ item.stock_qty }}</strong></td>
               <td>
                 {% if item.stock_qty > 5 %}
                   <span class="badge badge-ok">In Stock</span>
@@ -307,8 +367,28 @@ BASE_TEMPLATE = """
       </div>
 
     {% elif page == 'history' %}
+      <div class="grid grid-3" style="margin-bottom: 1.5rem;">
+        <div class="stat-box">
+          <label>Total Sales Revenue</label>
+          <div class="stat-value" style="color: var(--primary);">₹{{ "%.2f"|format(total_revenue) }}</div>
+        </div>
+        <div class="stat-box">
+          <label>Total Cost of Goods</label>
+          <div class="stat-value" style="color: #64748b;">₹{{ "%.2f"|format(total_cost) }}</div>
+        </div>
+        <div class="stat-box">
+          <label>Total Net Profit</label>
+          <div class="stat-value" style="color: {% if total_profit >= 0 %}#16a34a{% else %}#dc2626{% endif %};">
+            ₹{{ "%.2f"|format(total_profit) }}
+          </div>
+        </div>
+      </div>
+
       <div class="card">
-        <h2 style="margin-top: 0;">Sales History</h2>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <h2 style="margin: 0;">Sales & Profit Register</h2>
+          <a href="{{ url_for('download_sales') }}" class="btn btn-outline">&#8681; Download Sales CSV</a>
+        </div>
         <table>
           <thead>
             <tr>
@@ -316,8 +396,10 @@ BASE_TEMPLATE = """
               <th>Date & Time</th>
               <th>Customer</th>
               <th>Payment</th>
-              <th>Amount</th>
-              <th>Actions</th>
+              <th>Total Cost</th>
+              <th>Revenue</th>
+              <th>Profit</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -327,9 +409,13 @@ BASE_TEMPLATE = """
               <td>{{ inv.created_at[:16] }}</td>
               <td>{{ inv.customer_name or 'Walk-in' }}</td>
               <td>{{ inv.payment_mode }}</td>
+              <td>₹{{ "%.2f"|format(inv.total_cost or 0) }}</td>
               <td><strong>₹{{ "%.2f"|format(inv.total_amount) }}</strong></td>
+              <td style="font-weight: bold; color: {% if (inv.profit or 0) >= 0 %}#16a34a{% else %}#dc2626{% endif %};">
+                ₹{{ "%.2f"|format(inv.profit or 0) }}
+              </td>
               <td>
-                <a href="{{ url_for('invoice_view', inv_id=inv.id) }}" class="btn" style="padding: 0.3rem 0.6rem; font-size: 0.8rem;">View & Print</a>
+                <a href="{{ url_for('invoice_view', inv_id=inv.id) }}" class="btn" style="padding: 0.3rem 0.6rem; font-size: 0.8rem;">View Bill</a>
               </td>
             </tr>
             {% endfor %}
@@ -415,24 +501,39 @@ def inventory():
 def sales_history():
     with get_db() as conn:
         invoices = conn.execute("SELECT * FROM invoices ORDER BY id DESC").fetchall()
-    return render_template_string(BASE_TEMPLATE, page='history', invoices=invoices)
+        
+        total_revenue = sum(inv['total_amount'] for inv in invoices)
+        total_cost = sum(inv['total_cost'] or 0 for inv in invoices)
+        total_profit = sum(inv['profit'] or 0 for inv in invoices)
+
+    return render_template_string(
+        BASE_TEMPLATE, 
+        page='history', 
+        invoices=invoices, 
+        total_revenue=total_revenue, 
+        total_cost=total_cost, 
+        total_profit=total_profit
+    )
 
 @app.route('/save-product', methods=['POST'])
 def save_product():
     name = request.form['name'].strip()
     sku = request.form.get('sku', '').strip() or None
-    price = float(request.form['selling_price'])
-    stock = int(request.form['stock_qty'])
+    cost_price = float(request.form.get('cost_price', 0))
+    selling_price = float(request.form.get('selling_price', 0))
+    min_selling_price = float(request.form.get('min_selling_price', 0))
+    stock = int(request.form.get('stock_qty', 0))
 
     with get_db() as conn:
         try:
             conn.execute(
-                "INSERT INTO products (name, sku, selling_price, stock_qty) VALUES (?, ?, ?, ?)",
-                (name, sku, price, stock)
+                """INSERT INTO products (name, sku, cost_price, selling_price, min_selling_price, stock_qty) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name, sku, cost_price, selling_price, min_selling_price, stock)
             )
-            flash(f"Item '{name}' added successfully.")
+            flash(f"Product '{name}' added successfully.")
         except sqlite3.IntegrityError:
-            flash(f"Error: SKU '{sku}' is already assigned to another product.", "error")
+            flash(f"Error: SKU '{sku}' is already taken.", "error")
     return redirect(url_for('inventory'))
 
 @app.route('/adjust-stock', methods=['POST'])
@@ -441,7 +542,7 @@ def adjust_stock():
     add_qty = int(request.form['add_qty'])
     with get_db() as conn:
         conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?", (add_qty, p_id))
-    flash("Stock updated successfully.")
+    flash("Stock quantity updated.")
     return redirect(url_for('inventory'))
 
 @app.route('/checkout', methods=['POST'])
@@ -451,6 +552,7 @@ def checkout():
     pay_mode = request.form.get('payment_mode', 'Cash')
 
     product_ids = request.form.getlist('item_id[]')
+    unit_prices = request.form.getlist('unit_price[]')
     quantities = request.form.getlist('quantity[]')
 
     if not product_ids:
@@ -458,41 +560,51 @@ def checkout():
         return redirect(url_for('pos'))
 
     with get_db() as conn:
-        total_bill = 0
+        total_revenue = 0
+        total_cost = 0
         items_to_save = []
 
-        for p_id, q_str in zip(product_ids, quantities):
+        for p_id, u_price, q_str in zip(product_ids, unit_prices, quantities):
             if not p_id:
                 continue
             qty = int(q_str)
+            price = float(u_price)
             prod = conn.execute("SELECT * FROM products WHERE id = ?", (p_id,)).fetchone()
+            
             if not prod or prod['stock_qty'] < qty:
                 flash(f"Insufficient stock for {prod['name'] if prod else 'Item'}.", "error")
                 return redirect(url_for('pos'))
+
+            # Optional: warn or track against min_selling_price
+            cost = (prod['cost_price'] or 0) * qty
+            subtotal = price * qty
             
-            sub = prod['selling_price'] * qty
-            total_bill += sub
-            items_to_save.append((prod['id'], prod['name'], prod['selling_price'], qty, sub))
+            total_revenue += subtotal
+            total_cost += cost
+            items_to_save.append((prod['id'], prod['name'], prod['cost_price'] or 0, price, qty, subtotal))
 
         if not items_to_save:
             flash("No valid line items provided.", "error")
             return redirect(url_for('pos'))
 
+        profit = total_revenue - total_cost
         inv_num = f"RUI-{datetime.now().strftime('%y%m%d%H%M%S')}"
         now = datetime.now().isoformat()
 
         cur = conn.execute(
-            "INSERT INTO invoices (invoice_no, customer_name, customer_phone, total_amount, payment_mode, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (inv_num, cust_name, cust_phone, total_bill, pay_mode, now)
+            """INSERT INTO invoices (invoice_no, customer_name, customer_phone, total_amount, total_cost, profit, payment_mode, created_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (inv_num, cust_name, cust_phone, total_revenue, total_cost, profit, pay_mode, now)
         )
         inv_id = cur.lastrowid
 
         for it in items_to_save:
             conn.execute(
-                "INSERT INTO invoice_items (invoice_id, product_id, product_name, unit_price, quantity, subtotal) VALUES (?, ?, ?, ?, ?, ?)",
-                (inv_id, it[0], it[1], it[2], it[3], it[4])
+                """INSERT INTO invoice_items (invoice_id, product_id, product_name, cost_price, unit_price, quantity, subtotal) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (inv_id, it[0], it[1], it[2], it[3], it[4], it[5])
             )
-            conn.execute("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?", (it[3], it[0]))
+            conn.execute("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?", (it[4], it[0]))
 
     return redirect(url_for('invoice_view', inv_id=inv_id))
 
@@ -512,6 +624,55 @@ def invoice_view(inv_id):
         whatsapp_url = f"https://api.whatsapp.com/send?phone={clean_phone}&text={urllib.parse.quote(text)}"
 
     return render_template_string(BASE_TEMPLATE, page='invoice_view', inv=inv, items=items, whatsapp_url=whatsapp_url)
+
+@app.route('/download/inventory')
+def download_inventory():
+    with get_db() as conn:
+        products = conn.execute("SELECT sku, name, cost_price, selling_price, min_selling_price, stock_qty FROM products ORDER BY name ASC").fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['SKU', 'Product Name', 'Buying Price (Rs)', 'Selling Price (Rs)', 'Min Selling Price (Rs)', 'Stock Units'])
+
+    for p in products:
+        writer.writerow([p['sku'] or '', p['name'], p['cost_price'] or 0, p['selling_price'], p['min_selling_price'] or 0, p['stock_qty']])
+
+    output.seek(0)
+    filename = f"ruigandh_inventory_{datetime.now().strftime('%Y%m%d')}.csv"
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={filename}"}
+    )
+
+@app.route('/download/sales')
+def download_sales():
+    with get_db() as conn:
+        invoices = conn.execute("SELECT invoice_no, created_at, customer_name, customer_phone, payment_mode, total_cost, total_amount, profit FROM invoices ORDER BY id DESC").fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Invoice No', 'Date', 'Customer Name', 'Phone', 'Payment Mode', 'Cost Amount (Rs)', 'Revenue (Rs)', 'Net Profit (Rs)'])
+
+    for inv in invoices:
+        writer.writerow([
+            inv['invoice_no'],
+            inv['created_at'][:19],
+            inv['customer_name'] or 'Walk-in',
+            inv['customer_phone'] or '',
+            inv['payment_mode'],
+            inv['total_cost'] or 0,
+            inv['total_amount'],
+            inv['profit'] or 0
+        ])
+
+    output.seek(0)
+    filename = f"ruigandh_sales_report_{datetime.now().strftime('%Y%m%d')}.csv"
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={filename}"}
+    )
 
 if __name__ == '__main__':
     print("Ruigandh app running locally at http://127.0.0.1:5000")
