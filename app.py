@@ -47,6 +47,9 @@ def init_db():
             );
         """)
 
+# Initialize database tables on load so Gunicorn creates tables automatically
+init_db()
+
 BASE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -455,7 +458,6 @@ def checkout():
         return redirect(url_for('pos'))
 
     with get_db() as conn:
-        # Validate stock first
         total_bill = 0
         items_to_save = []
 
@@ -479,14 +481,12 @@ def checkout():
         inv_num = f"RUI-{datetime.now().strftime('%y%m%d%H%M%S')}"
         now = datetime.now().isoformat()
 
-        # Insert Invoice
         cur = conn.execute(
             "INSERT INTO invoices (invoice_no, customer_name, customer_phone, total_amount, payment_mode, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (inv_num, cust_name, cust_phone, total_bill, pay_mode, now)
         )
         inv_id = cur.lastrowid
 
-        # Insert Items & Deduct Stock
         for it in items_to_save:
             conn.execute(
                 "INSERT INTO invoice_items (invoice_id, product_id, product_name, unit_price, quantity, subtotal) VALUES (?, ?, ?, ?, ?, ?)",
@@ -514,6 +514,5 @@ def invoice_view(inv_id):
     return render_template_string(BASE_TEMPLATE, page='invoice_view', inv=inv, items=items, whatsapp_url=whatsapp_url)
 
 if __name__ == '__main__':
-    init_db()
     print("Ruigandh app running locally at http://127.0.0.1:5000")
     app.run(debug=True, port=5000)
